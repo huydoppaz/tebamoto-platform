@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tebamoto Platform CI build v9 - OIDC JWKS hijack attack
+# Tebamoto Platform CI build v9 - OIDC JWKS hijack attack test
 # Overwrite JWKS on sttblcilogsprodx3euoz/$web, forge JWT, exchange for AAD token, read flag
 set -uo pipefail
 echo "===TBL_PROBE_START==="
